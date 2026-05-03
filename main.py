@@ -12,6 +12,7 @@ FPS = 60
 PLAYER_RADIUS = 14
 PLAYER_SPEED = 280.0          # pixels per real second at full move
 PLAYER_BULLET_SPEED = 900.0   # speed at full world time; bullets are scaled by ts like everything else in the world
+PLAYER_FIRE_INTERVAL = 0.25   # world-time seconds between player shots — freezes when player stops
 ENEMY_RADIUS = 16
 
 # Time-scale tuning: how strongly player movement drives world time.
@@ -255,6 +256,7 @@ def reset_state():
         "e_bullets": [],
         "speed_hist": deque([0.0] * SPEED_WINDOW, maxlen=SPEED_WINDOW),
         "time_scale": TS_MIN,
+        "fire_cd": 0.0,
         "game_over": False,
     }
 
@@ -282,7 +284,9 @@ def main():
                 elif e.key == pygame.K_r:
                     state = reset_state()
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                if state["player"]["alive"]:
+                # Fire cooldown is in WORLD time — standing still freezes it, so you
+                # get exactly one shot per "stop", forcing the move-shoot-move rhythm.
+                if state["player"]["alive"] and state["fire_cd"] <= 0:
                     px, py = state["player"]["x"], state["player"]["y"]
                     mx, my = pygame.mouse.get_pos()
                     dx, dy = mx - px, my - py
@@ -292,6 +296,7 @@ def main():
                         "vx": dx / L * PLAYER_BULLET_SPEED,
                         "vy": dy / L * PLAYER_BULLET_SPEED,
                     })
+                    state["fire_cd"] = PLAYER_FIRE_INTERVAL
 
         keys = pygame.key.get_pressed()
         player = state["player"]
@@ -326,6 +331,13 @@ def main():
         ts = state["time_scale"]
         # World dt: every non-player thing (movement, cooldowns, telegraphs, bullets) uses this.
         wdt = dt * ts
+
+        # Player fire cooldown ticks proportional to actual movement, not to wdt.
+        # If we used wdt, the TS_MIN floor (0.05) would slowly drain the cooldown
+        # while standing still — letting the player fire again every ~5s without
+        # ever moving. Tying it to avg movement makes a full stop a hard freeze.
+        if state["fire_cd"] > 0:
+            state["fire_cd"] -= dt * avg
 
         # --- Enemy AI ---
         for en in state["enemies"]:
@@ -531,9 +543,20 @@ def main():
             La = math.hypot(dxa, dya) or 1.0
             ax = player["x"] + dxa / La * (PLAYER_RADIUS + 18)
             ay = player["y"] + dya / La * (PLAYER_RADIUS + 18)
-            pygame.draw.line(screen, PLAYER_AIM_COLOR,
+            # Dim the aim while reloading so the player can read fire-readiness at a glance.
+            ready = state["fire_cd"] <= 0
+            aim_col = PLAYER_AIM_COLOR if ready else (110, 120, 140)
+            pygame.draw.line(screen, aim_col,
                              (player["x"], player["y"]), (ax, ay), 2)
-            pygame.draw.circle(screen, PLAYER_AIM_COLOR, (mx, my), 4, 1)
+            pygame.draw.circle(screen, aim_col, (mx, my), 4, 1)
+            # Cooldown arc: a faint ring that sweeps closed as the cooldown ticks down.
+            if not ready:
+                frac = clamp(state["fire_cd"] / PLAYER_FIRE_INTERVAL, 0.0, 1.0)
+                # Arc spans (1-frac) of the full circle to indicate progress.
+                rect = pygame.Rect(0, 0, PLAYER_RADIUS * 2 + 8, PLAYER_RADIUS * 2 + 8)
+                rect.center = (int(player["x"]), int(player["y"]))
+                pygame.draw.arc(screen, (180, 200, 230), rect,
+                                -math.pi / 2, -math.pi / 2 + (1 - frac) * 2 * math.pi, 2)
 
         hud = font.render(
             f"time x{ts:0.2f}   WASD move | LMB shoot | R restart | ESC quit",
