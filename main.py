@@ -11,7 +11,7 @@ FPS = 60
 
 PLAYER_RADIUS = 14
 PLAYER_SPEED = 280.0          # pixels per real second at full move
-PLAYER_BULLET_SPEED = 900.0   # player bullets are NOT affected by time scale (player's own actions)
+PLAYER_BULLET_SPEED = 900.0   # speed at full world time; bullets are scaled by ts like everything else in the world
 ENEMY_RADIUS = 16
 
 # Time-scale tuning: how strongly player movement drives world time.
@@ -431,12 +431,16 @@ def main():
                         en["fire_cd"] = cfg["fire_interval"]
                         en["burst_left"] = cfg["burst_size"]
 
-        # --- Player bullets (real time) ---
+        # --- Player bullets (world time) ---
+        # Once a bullet is in the air it belongs to the world, so it slows down with
+        # everything else when the player stops. This is the core SUPERHOT loop:
+        # you can't pre-fire from cover and then sit still — to actually hit anything
+        # you have to commit to motion, which also wakes the enemies up.
         new_pb = []
         for b in state["p_bullets"]:
             x0, y0 = b["x"], b["y"]
-            b["x"] += b["vx"] * dt
-            b["y"] += b["vy"] * dt
+            b["x"] += b["vx"] * wdt
+            b["y"] += b["vy"] * wdt
             if not (0 <= b["x"] <= WIDTH and 0 <= b["y"] <= HEIGHT):
                 continue
             if any(seg_rect_hit(x0, y0, b["x"], b["y"], w) for w in walls):
