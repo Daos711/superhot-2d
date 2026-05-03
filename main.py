@@ -209,54 +209,92 @@ def fire_at(en, tx, ty, speed, e_bullets):
     })
 
 
-def make_scene():
-    walls = [
+def make_walls():
+    return [
         pygame.Rect(300, 180, 220, 40),
         pygame.Rect(820, 200, 40, 240),
         pygame.Rect(420, 460, 280, 40),
         pygame.Rect(180, 520, 40, 160),
     ]
-    # 3 shooters + 3 runners + 2 snipers — covers angles, makes simple stand-and-fire
-    # impossible: shooters orbit, runners crash in, snipers cover the sides.
-    spec = [
-        ("shooter", 100,  100),
-        ("shooter", 1180, 620),
-        ("shooter", 100,  620),
-        ("runner",  1180, 100),
-        ("runner",  640,  60),
-        ("runner",  640,  660),
-        ("sniper",  60,   360),
-        ("sniper",  1220, 360),
-    ]
+
+
+def random_edge_pos(walls, player_pos, min_player_dist=320.0):
+    """Pick a random position just inside one of the screen edges, avoiding walls
+    and not too close to the player (so reinforcements don't materialise on top of you)."""
+    px, py = player_pos
+    for _ in range(60):
+        side = random.randint(0, 3)
+        if side == 0:
+            x, y = random.uniform(40, WIDTH - 40), 40
+        elif side == 1:
+            x, y = random.uniform(40, WIDTH - 40), HEIGHT - 40
+        elif side == 2:
+            x, y = 40, random.uniform(40, HEIGHT - 40)
+        else:
+            x, y = WIDTH - 40, random.uniform(40, HEIGHT - 40)
+        if any(w.inflate(40, 40).collidepoint(x, y) for w in walls):
+            continue
+        if math.hypot(x - px, y - py) < min_player_dist:
+            continue
+        return x, y
+    return 40.0, 40.0
+
+
+def make_enemy(kind, x, y, wave):
+    """Per-wave scaling is baked into the enemy at spawn so the AI loop doesn't
+    have to know about waves. Each wave bumps speed, fire rate and bullet speed."""
+    cfg = ENEMY_KINDS[kind]
+    sm = 1.0 + 0.06 * (wave - 1)              # speed multiplier
+    fm = max(0.55, 1.0 - 0.07 * (wave - 1))   # fire interval multiplier (lower = faster)
+    bm = 1.0 + 0.04 * (wave - 1)              # bullet speed multiplier
+    fire_interval = cfg["fire_interval"] * fm
+    return {
+        "kind": kind,
+        "x": float(x), "y": float(y),
+        "speed": cfg["speed"] * sm,
+        "fire_interval": fire_interval,
+        "burst_gap": cfg.get("burst_gap", 0.0) * fm,
+        "bullet_speed": cfg["bullet_speed"] * bm,
+        "fire_cd": random.uniform(0.4, max(0.6, fire_interval)),
+        "burst_left": cfg.get("burst_size", 1),
+        "aim_t": 0.0,
+        "aim_x": float(x), "aim_y": float(y),
+        "slide": random.choice((-1, 1)),
+        "strafe": random.choice((-1, 1)),
+        "strafe_timer": random.uniform(1.5, 3.5),
+        "alive": True,
+    }
+
+
+def spawn_wave(walls, player_pos, wave):
+    """Wave composition grows with wave number. Positions are random along the
+    screen edges so the player can't memorise spawn corners."""
+    n_shooters = 2 + wave // 2
+    n_runners = 2 + wave // 2
+    n_snipers = 1 + wave // 3
     enemies = []
-    for kind, x, y in spec:
-        cfg = ENEMY_KINDS[kind]
-        enemies.append({
-            "kind": kind,
-            "x": float(x), "y": float(y),
-            "fire_cd": random.uniform(0.4, max(0.5, cfg["fire_interval"])),
-            "burst_left": cfg.get("burst_size", 1),
-            "aim_t": 0.0,            # >0 means sniper is in telegraph phase
-            "aim_x": float(x), "aim_y": float(y),
-            "slide": random.choice((-1, 1)),
-            "strafe": random.choice((-1, 1)),
-            "strafe_timer": random.uniform(1.5, 3.5),
-            "alive": True,
-        })
-    return walls, enemies
+    for kind, count in (("shooter", n_shooters), ("runner", n_runners), ("sniper", n_snipers)):
+        for _ in range(count):
+            x, y = random_edge_pos(walls, player_pos)
+            enemies.append(make_enemy(kind, x, y, wave))
+    return enemies
 
 
 def reset_state():
-    walls, enemies = make_scene()
+    walls = make_walls()
+    player_pos = (WIDTH * 0.5, HEIGHT * 0.5)
     return {
-        "player": {"x": WIDTH * 0.5, "y": HEIGHT * 0.5, "vx": 0.0, "vy": 0.0, "alive": True},
+        "player": {"x": player_pos[0], "y": player_pos[1], "vx": 0.0, "vy": 0.0, "alive": True},
         "walls": walls,
-        "enemies": enemies,
+        "enemies": spawn_wave(walls, player_pos, 1),
         "p_bullets": [],
         "e_bullets": [],
         "speed_hist": deque([0.0] * SPEED_WINDOW, maxlen=SPEED_WINDOW),
         "time_scale": TS_MIN,
         "fire_cd": 0.0,
+        "wave": 1,
+        "kills": 0,
+        "wave_banner_t": 1.5,   # real-time seconds the "WAVE N" banner stays up
         "game_over": False,
     }
 
@@ -382,7 +420,7 @@ def main():
                     mvx, mvy = steer_toward(en, bx, by, walls)
 
             if mvx or mvy:
-                speed = cfg["speed"]
+                speed = en["speed"]
                 en["x"], en["y"] = move_circle_against_walls(
                     en["x"], en["y"], ENEMY_RADIUS,
                     mvx * speed * wdt, mvy * speed * wdt, walls
@@ -407,7 +445,7 @@ def main():
                 if cfg["lead"] and player["alive"]:
                     en["aim_x"], en["aim_y"] = predict_target(
                         en["x"], en["y"], player["x"], player["y"],
-                        player["vx"], player["vy"], cfg["bullet_speed"]
+                        player["vx"], player["vy"], en["bullet_speed"]
                     )
                 else:
                     en["aim_x"], en["aim_y"] = player["x"], player["y"]
@@ -418,8 +456,8 @@ def main():
                     if not los:
                         en["aim_t"] = 0.0  # cancel if cover is taken during telegraph
                     elif en["aim_t"] <= 0 and player["alive"]:
-                        fire_at(en, en["aim_x"], en["aim_y"], cfg["bullet_speed"], state["e_bullets"])
-                        en["fire_cd"] = cfg["fire_interval"]
+                        fire_at(en, en["aim_x"], en["aim_y"], en["bullet_speed"], state["e_bullets"])
+                        en["fire_cd"] = en["fire_interval"]
                         en["aim_t"] = 0.0
                 else:
                     en["fire_cd"] -= wdt
@@ -431,16 +469,16 @@ def main():
                     if cfg["lead"]:
                         tx, ty = predict_target(
                             en["x"], en["y"], player["x"], player["y"],
-                            player["vx"], player["vy"], cfg["bullet_speed"]
+                            player["vx"], player["vy"], en["bullet_speed"]
                         )
                     else:
                         tx, ty = player["x"], player["y"]
-                    fire_at(en, tx, ty, cfg["bullet_speed"], state["e_bullets"])
+                    fire_at(en, tx, ty, en["bullet_speed"], state["e_bullets"])
                     en["burst_left"] -= 1
                     if en["burst_left"] > 0:
-                        en["fire_cd"] = cfg["burst_gap"]
+                        en["fire_cd"] = en["burst_gap"]
                     else:
-                        en["fire_cd"] = cfg["fire_interval"]
+                        en["fire_cd"] = en["fire_interval"]
                         en["burst_left"] = cfg["burst_size"]
 
         # --- Player bullets (world time) ---
@@ -461,6 +499,7 @@ def main():
             for en in state["enemies"]:
                 if en["alive"] and (en["x"] - b["x"]) ** 2 + (en["y"] - b["y"]) ** 2 < ENEMY_RADIUS ** 2:
                     en["alive"] = False
+                    state["kills"] += 1
                     hit = True
                     break
             if hit:
@@ -486,8 +525,15 @@ def main():
             new_eb.append(b)
         state["e_bullets"] = new_eb
 
-        if all(not en["alive"] for en in state["enemies"]):
-            state["game_over"] = True
+        # Wave progression: clearing every enemy spawns the next, harder wave.
+        # The game only ends on the player's death.
+        if state["enemies"] and all(not en["alive"] for en in state["enemies"]) and player["alive"]:
+            state["wave"] += 1
+            state["enemies"] = spawn_wave(walls, (player["x"], player["y"]), state["wave"])
+            state["wave_banner_t"] = 1.5
+
+        if state["wave_banner_t"] > 0:
+            state["wave_banner_t"] -= dt
 
         # --- Draw ---
         screen.fill(BG)
@@ -559,18 +605,26 @@ def main():
                                 -math.pi / 2, -math.pi / 2 + (1 - frac) * 2 * math.pi, 2)
 
         hud = font.render(
-            f"time x{ts:0.2f}   WASD move | LMB shoot | R restart | ESC quit",
+            f"WAVE {state['wave']}   KILLS {state['kills']}   time x{ts:0.2f}   "
+            f"WASD move | LMB shoot | R restart | ESC quit",
             True, HUD_COLOR
         )
         screen.blit(hud, (10, 10))
 
+        # "WAVE N" banner that fades in on each new wave so the player notices the
+        # difficulty bump without breaking flow.
+        if state["wave_banner_t"] > 0 and player["alive"]:
+            banner = big_font.render(f"WAVE {state['wave']}", True, (240, 240, 240))
+            screen.blit(banner, banner.get_rect(center=(WIDTH // 2, 90)))
+
         if state["game_over"]:
-            won = all(not en["alive"] for en in state["enemies"]) and player["alive"]
-            msg = "YOU WIN" if won else "YOU DIED"
-            text = big_font.render(msg, True, (255, 255, 255))
-            sub = font.render("Press R to restart", True, HUD_COLOR)
+            text = big_font.render("YOU DIED", True, (255, 255, 255))
+            score = font.render(
+                f"Wave {state['wave']} reached  |  {state['kills']} kills  |  press R to restart",
+                True, HUD_COLOR
+            )
             screen.blit(text, text.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 20)))
-            screen.blit(sub, sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 30)))
+            screen.blit(score, score.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 30)))
 
         pygame.display.flip()
 
