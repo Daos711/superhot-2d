@@ -33,16 +33,18 @@ HUD_COLOR = (220, 220, 220)
 ENEMY_KINDS = {
     "shooter": {
         "color": (230, 70, 70),
-        "speed": 95.0,
-        "fire_interval": 1.5,
-        "bullet_speed": 360.0,
-        "preferred_dist": 250.0,
+        "speed": 115.0,
+        "fire_interval": 1.4,     # gap between bursts (world seconds)
+        "burst_size": 2,          # shots per burst
+        "burst_gap": 0.22,        # short cooldown between shots inside a burst
+        "bullet_speed": 410.0,
+        "preferred_dist": 260.0,
         "lead": True,
     },
     "runner": {
         "color": (255, 150, 50),
-        "speed": 175.0,           # ~1.8x of shooter
-        "fire_interval": 0.0,     # melee, no shooting
+        "speed": 200.0,           # ~1.7x of shooter
+        "fire_interval": 0.0,
         "bullet_speed": 0.0,
         "preferred_dist": 0.0,
         "lead": False,
@@ -50,10 +52,12 @@ ENEMY_KINDS = {
     "sniper": {
         "color": (150, 30, 55),
         "speed": 55.0,
-        "fire_interval": 3.5,
-        "bullet_speed": 720.0,
-        "preferred_dist": 420.0,
-        "telegraph_time": 0.5,    # world seconds the red beam is visible before firing
+        "fire_interval": 3.0,
+        "burst_size": 1,
+        "burst_gap": 0.0,
+        "bullet_speed": 760.0,
+        "preferred_dist": 430.0,
+        "telegraph_time": 0.55,   # world seconds the red beam is visible before firing
         "lead": True,
     },
 }
@@ -93,6 +97,42 @@ def seg_rect_hit(x1, y1, x2, y2, rect):
 def has_los(x1, y1, x2, y2, walls):
     """Line of sight: no wall blocks the segment."""
     return not any(seg_rect_hit(x1, y1, x2, y2, w) for w in walls)
+
+
+def ray_first_wall(ox, oy, dx, dy, walls, max_t):
+    """
+    Distance along unit ray (ox,oy)+t*(dx,dy) until it first enters a wall, or max_t.
+    Used to draw the sniper telegraph beam: it stops at whatever the bullet would hit,
+    so the player sees the actual bullet path instead of a line to a hidden lead point.
+    """
+    best = max_t
+    for w in walls:
+        t_min, t_max = 0.0, best
+        ok = True
+        for axis in (0, 1):
+            o = ox if axis == 0 else oy
+            d = dx if axis == 0 else dy
+            lo = w.left if axis == 0 else w.top
+            hi = w.right if axis == 0 else w.bottom
+            if abs(d) < 1e-9:
+                if o < lo or o > hi:
+                    ok = False
+                    break
+                continue
+            t1 = (lo - o) / d
+            t2 = (hi - o) / d
+            if t1 > t2:
+                t1, t2 = t2, t1
+            if t1 > t_min:
+                t_min = t1
+            if t2 < t_max:
+                t_max = t2
+            if t_min > t_max:
+                ok = False
+                break
+        if ok and 0 < t_min < best:
+            best = t_min
+    return best
 
 
 def move_circle_against_walls(x, y, r, dx, dy, walls):
@@ -175,13 +215,17 @@ def make_scene():
         pygame.Rect(420, 460, 280, 40),
         pygame.Rect(180, 520, 40, 160),
     ]
-    # 2 shooters, 2 runners, 1 sniper — placed near edges, away from walls.
+    # 3 shooters + 3 runners + 2 snipers — covers angles, makes simple stand-and-fire
+    # impossible: shooters orbit, runners crash in, snipers cover the sides.
     spec = [
-        ("shooter", 100, 100),
+        ("shooter", 100,  100),
         ("shooter", 1180, 620),
+        ("shooter", 100,  620),
         ("runner",  1180, 100),
-        ("runner",  100, 620),
-        ("sniper",  640, 60),
+        ("runner",  640,  60),
+        ("runner",  640,  660),
+        ("sniper",  60,   360),
+        ("sniper",  1220, 360),
     ]
     enemies = []
     for kind, x, y in spec:
@@ -190,9 +234,12 @@ def make_scene():
             "kind": kind,
             "x": float(x), "y": float(y),
             "fire_cd": random.uniform(0.4, max(0.5, cfg["fire_interval"])),
+            "burst_left": cfg.get("burst_size", 1),
             "aim_t": 0.0,            # >0 means sniper is in telegraph phase
             "aim_x": float(x), "aim_y": float(y),
             "slide": random.choice((-1, 1)),
+            "strafe": random.choice((-1, 1)),
+            "strafe_timer": random.uniform(1.5, 3.5),
             "alive": True,
         })
     return walls, enemies
@@ -296,20 +343,31 @@ def main():
             if kind == "runner":
                 mvx, mvy = steer_toward(en, player["x"], player["y"], walls)
             elif kind == "shooter":
+                # Orbit at preferred_dist: target sits on a circle around the player,
+                # offset by ~35 deg in current strafe direction. Periodic flips of
+                # strafe sign keep movement unpredictable so the player can't pre-aim.
                 ideal = cfg["preferred_dist"]
-                if dist < ideal - 30:
-                    # Back away from player along reverse vector (still respect walls).
-                    mvx, mvy = steer_toward(en, en["x"] - dx / dist * 200,
-                                            en["y"] - dy / dist * 200, walls)
-                elif dist > ideal + 30 or not los:
-                    mvx, mvy = steer_toward(en, player["x"], player["y"], walls)
+                cur_angle = math.atan2(en["y"] - player["y"], en["x"] - player["x"])
+                strafe_angle = cur_angle + en["strafe"] * 0.6
+                tx = player["x"] + math.cos(strafe_angle) * ideal
+                ty = player["y"] + math.sin(strafe_angle) * ideal
+                tx = clamp(tx, ENEMY_RADIUS + 6, WIDTH - ENEMY_RADIUS - 6)
+                ty = clamp(ty, ENEMY_RADIUS + 6, HEIGHT - ENEMY_RADIUS - 6)
+                mvx, mvy = steer_toward(en, tx, ty, walls)
+                en["strafe_timer"] -= wdt
+                if en["strafe_timer"] <= 0:
+                    en["strafe"] *= -1
+                    en["strafe_timer"] = random.uniform(1.5, 3.5)
             elif kind == "sniper":
                 ideal = cfg["preferred_dist"]
                 if not los or dist > ideal + 60:
                     mvx, mvy = steer_toward(en, player["x"], player["y"], walls)
                 elif dist < ideal - 100:
-                    mvx, mvy = steer_toward(en, en["x"] - dx / dist * 200,
-                                            en["y"] - dy / dist * 200, walls)
+                    # Back away, but clamp the target into the playable area so the
+                    # sniper doesn't try to walk off the screen edge.
+                    bx = clamp(en["x"] - dx / dist * 200, ENEMY_RADIUS + 6, WIDTH - ENEMY_RADIUS - 6)
+                    by = clamp(en["y"] - dy / dist * 200, ENEMY_RADIUS + 6, HEIGHT - ENEMY_RADIUS - 6)
+                    mvx, mvy = steer_toward(en, bx, by, walls)
 
             if mvx or mvy:
                 speed = cfg["speed"]
@@ -317,6 +375,10 @@ def main():
                     en["x"], en["y"], ENEMY_RADIUS,
                     mvx * speed * wdt, mvy * speed * wdt, walls
                 )
+            # Hard clamp to screen — without this, anything aimed at a target near
+            # the edge can creep out (the wall collider doesn't know about screen bounds).
+            en["x"] = clamp(en["x"], ENEMY_RADIUS, WIDTH - ENEMY_RADIUS)
+            en["y"] = clamp(en["y"], ENEMY_RADIUS, HEIGHT - ENEMY_RADIUS)
 
             # --- Combat per kind ---
             if kind == "runner":
@@ -351,7 +413,7 @@ def main():
                     en["fire_cd"] -= wdt
                     if en["fire_cd"] <= 0 and los and player["alive"]:
                         en["aim_t"] = cfg["telegraph_time"]
-            else:  # shooter
+            else:  # shooter — fires bursts of cfg["burst_size"] shots
                 en["fire_cd"] -= wdt
                 if en["fire_cd"] <= 0 and los and player["alive"]:
                     if cfg["lead"]:
@@ -362,7 +424,12 @@ def main():
                     else:
                         tx, ty = player["x"], player["y"]
                     fire_at(en, tx, ty, cfg["bullet_speed"], state["e_bullets"])
-                    en["fire_cd"] = cfg["fire_interval"]
+                    en["burst_left"] -= 1
+                    if en["burst_left"] > 0:
+                        en["fire_cd"] = cfg["burst_gap"]
+                    else:
+                        en["fire_cd"] = cfg["fire_interval"]
+                        en["burst_left"] = cfg["burst_size"]
 
         # --- Player bullets (real time) ---
         new_pb = []
@@ -411,21 +478,26 @@ def main():
         for w in walls:
             pygame.draw.rect(screen, WALL_COLOR, w)
 
-        # Sniper telegraph beams behind enemies so the body sits on top.
+        # Sniper telegraph beams: traced as the actual bullet ray (clipped at the first
+        # wall hit) so the player sees exactly where the shot will fly, regardless of
+        # where the predicted lead point actually sits.
         for en in state["enemies"]:
             if not en["alive"] or en["kind"] != "sniper" or en["aim_t"] <= 0:
                 continue
             cfg = ENEMY_KINDS["sniper"]
+            ddx = en["aim_x"] - en["x"]
+            ddy = en["aim_y"] - en["y"]
+            L = math.hypot(ddx, ddy) or 1.0
+            ndx, ndy = ddx / L, ddy / L
+            t_end = ray_first_wall(en["x"], en["y"], ndx, ndy, walls, 2000.0)
+            ex = en["x"] + ndx * t_end
+            ey = en["y"] + ndy * t_end
             progress = 1.0 - en["aim_t"] / cfg["telegraph_time"]
-            # Beam brightens and thickens as the shot approaches — even when frozen,
-            # the player can read how close to firing the sniper is.
             r = int(110 + 145 * progress)
             g = int(20 + 40 * progress)
             b_ = int(40 + 60 * progress)
             thick = 1 + int(progress * 2)
-            pygame.draw.line(screen, (r, g, b_),
-                             (en["x"], en["y"]),
-                             (en["aim_x"], en["aim_y"]), thick)
+            pygame.draw.line(screen, (r, g, b_), (en["x"], en["y"]), (ex, ey), thick)
 
         for en in state["enemies"]:
             if not en["alive"]:
